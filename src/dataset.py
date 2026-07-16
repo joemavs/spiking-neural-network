@@ -53,7 +53,7 @@ def whiten_velocity(vel):
     return velw
 
 
-def create_splits(vel_times, segment_length=1.0):
+def create_data_splits(vel_times, segment_length=1.0):
     """
     Create train, validation and test splits by dividing the recording
     into repeating 20-second blocks.

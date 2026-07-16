@@ -6,320 +6,151 @@ class SurrogateHeaviside(torch.autograd.Function):
     """
     Here we implement our spiking nonlinearity which also implements
     the surrogate gradient. By subclassing torch.autograd.Function,
-    we are able to use PyTorch's autograd functionality.
-
-    Here we use the normalized negative part of a fast sigmoid,
+    we will be able to use all of PyTorch's autograd functionality.
+    Here we use the normalized negative part of a fast sigmoid
     as this was done in Zenke & Ganguli (2018).
     """
 
-    # Controls the steepness of the surrogate gradient
-    scale = 100.0
+    scale = 100.0 # controls steepness of surrogate gradient
 
     @staticmethod
-    def forward(ctx, input_tensor):
+    def forward(ctx, input):
         """
-        In the forward pass, compute a step function of the input tensor
-        and return it.
-
-        ctx is a context object used to store information needed later
-        when backpropagating the error signals. To achieve this, we use
-        the ctx.save_for_backward method.
+        In the forward pass we compute a step function of the input Tensor
+        and return it. ctx is a context object that we use to stash information which
+        we need to later backpropagate our error signals. To achieve this we use the
+        ctx.save_for_backward method.
         """
-
-        # Save the input so it can be used during the backward pass
-        ctx.save_for_backward(input_tensor)
-
-        # Create an output tensor with the same shape as the input
-        out = torch.zeros_like(input_tensor)
-
-        # Values above zero produce a spike
-        out[input_tensor > 0] = 1.0
-
+        ctx.save_for_backward(input)
+        out = torch.zeros_like(input)
+        out[input > 0] = 1.0
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
         """
-        In the backward pass, receive the gradient of the loss with
-        respect to the output and calculate a surrogate gradient with
-        respect to the input.
-
-        Here we use the normalized negative part of a fast sigmoid,
+        In the backward pass we receive a Tensor we need to compute the
+        surrogate gradient of the loss with respect to the input.
+        Here we use the normalized negative part of a fast sigmoid
         as this was done in Zenke & Ganguli (2018).
         """
-
-        # Retrieve the input saved during the forward pass
-        (input_tensor,) = ctx.saved_tensors
-
-        # Clone the incoming gradient
+        input, = ctx.saved_tensors
         grad_input = grad_output.clone()
-
-        # Calculate the surrogate gradient
-        grad = grad_input / (
-            SurrogateHeaviside.scale * torch.abs(input_tensor) + 1.0
-        ) ** 2
-
+        grad = grad_input/(SurrogateHeaviside.scale*torch.abs(input)+1.0)**2
         return grad
 
-
-# Here we overwrite our naive spike function with the
-# SurrogateHeaviside nonlinearity, which implements a surrogate gradient
-surrogate_heaviside = SurrogateHeaviside.apply
+# here we overwrite our naive spike function by the "SurrogateHeaviside" nonlinearity which implements a surrogate gradient
+surrogate_heaviside  = SurrogateHeaviside.apply
 
 
 class SNNLayer(nn.Module):
-    """
-    A layer of leaky integrate-and-fire neurons.
-
-    The layer can operate in either:
-
-    - spiking mode, where the outputs are binary spikes
-    - non-spiking mode, where the outputs are membrane potentials
-    """
-
     def __init__(self, n_in, n_out, spiking=True, dt=1e-3):
         """
-        Args:
-            n_in : int
-                Number of input neurons.
-            n_out : int
-                Number of output neurons.
-            spiking : bool
-                Whether this layer is spiking (True) or
-                non-spiking (False).
-            dt : float
-                Simulation time step in seconds.
+        n_in: number of input neurons
+        n_out: number of output neurons
+        spiking: whether this layer is spiking (True) or non-spiking (False)
+        dt: simulation time step (s)
         """
-
-        super().__init__()
-
+        super(SNNLayer, self).__init__()
         self.n_in = n_in
         self.n_out = n_out
         self.spiking = spiking
         self.dt = dt
 
         # Initialise trainable weight matrix
-        self.w = nn.Parameter(
-            0.15 * torch.randn(n_in, n_out)
-        )
+        self.w = nn.Parameter(0.15* torch.randn(n_in, n_out))
 
-        # Initialise time constants differently for spiking
-        # and non-spiking neurons
+        # Initialize time constants differently for spiking vs non-spiking neurons
         if spiking:
-            # 20–100 ms spread for LIF neurons
-            tau_min = 20 * dt
-            tau_max = 100 * dt
+            tau_min, tau_max = 20*dt, 100*dt # 20–100 ms spread for LIF neurons
         else:
-            # Longer time constants for non-spiking output neurons
-            tau_min = 200 * dt
-            tau_max = 1000 * dt
+            tau_min, tau_max = 200*dt, 1000*dt # longer time constants
 
         # Voltage parameters
-        self.v_rest = 0.0   # resting potential
-        self.v_reset = 0.0  # reset potential after spike
-        self.v_th = 1.0     # spike threshold
+        self.v_rest = 0.0      # resting potential
+        self.v_reset = 0.0     # reset potential after spike
+        self.v_th = 1.0        # spike threshold
 
-        # Initialise trainable tau in the previously specified range
-        tau_init = (
-            torch.rand(n_out) * (tau_max - tau_min) + tau_min
-        )
-
+        # Initialize trainable tau in the earlier specified range
+        tau_init = torch.rand(n_out) * (tau_max - tau_min) + tau_min
         self.tau = nn.Parameter(tau_init)
 
     def forward(self, x):
-        """
-        Forward pass of the LIF layer.
+            """
+            Forward pass of the LIF layer.
 
-        Args:
-            x : torch.Tensor
-                Tensor of shape
-                (batch_size, n_in, num_time_points).
+            Args:
+              x: tensor of shape (batch_size, n_in, num_time_points)
+                Input spike trains (0 or 1)
 
-                Contains the input spike trains or the outputs from
-                the preceding layer.
+            Returns:
+              y: tensor of shape (batch_size, n_out, num_time_points)
+                Spiking output (0/1) if spiking=True, or membrane potential otherwise
+              v_trace: tensor of shape (batch_size, n_out, num_time_points)
+                      Tracks membrane potential over time for all neurons
+            """
 
-        Returns:
-            y : torch.Tensor
-                Tensor of shape
-                (batch_size, n_out, num_time_points).
+            B, n_in, T = x.shape # batch size, input neurons, time points extracted from shape of x
 
-                Contains spiking output if spiking=True, or membrane
-                potential output if spiking=False.
+            # Compute input current for each neuron: I(t) = w_i * x_i(t)
+            # x: (B, n_in, T) -> transpose to (B, T, n_in) to match matmul with w
+            # w: (n_in, n_out)
+            # result: (B, T, n_out), then transposed back to (B, n_out, T)
+            I = torch.matmul(x.transpose(1, 2), self.w)
+            I = I.transpose(1, 2)
 
-            v_trace : torch.Tensor
-                Tensor of shape
-                (batch_size, n_out, num_time_points).
+            # Initialise membrane potential and output trace
+            v = torch.zeros((B, self.n_out), device=x.device) # current voltage
+            v_trace = torch.zeros((B, self.n_out, T), device=x.device) # recorded voltage over time
+            y = torch.zeros((B, self.n_out, T), device=x.device) # output (spikes or voltage)
 
-                Tracks membrane potential over time for all neurons.
-        """
+            # Reshape tau to broadcast over batch
+            tau = self.tau.view(1, self.n_out)
+            # Precompute alpha = exp(-dt / tau) for leaky integration
+            alpha = torch.exp(-self.dt / tau)
 
-        # Extract batch size, input neurons and time points
-        # from the shape of x
-        batch_size, n_in, num_time_points = x.shape
+            # Time-stepping loop
+            for t in range(T):
+                # Update membrane potential: v(t) = alpha * v(t-1) + I(t)
+                v = alpha*v+I[:, :, t]
+                v_trace[:, :, t] = v # record voltage
 
-        if n_in != self.n_in:
-            raise ValueError(
-                f"Expected {self.n_in} input neurons, "
-                f"but received {n_in}."
-            )
+                if self.spiking:
+                    # Generate spikes using surrogate Heaviside function
+                    spikes = surrogate_heaviside(v - self.v_th)  # threshold at 1.0
+                    # Reset voltage after spike
+                    v = v * (1.0 - spikes) + self.v_reset * spikes # reset voltage to v_reset where spikes occur, keep others unchanged
+                    y[:, :, t] = spikes
+                else:
+                    # Non-spiking mode, just records voltage
+                    y[:, :, t] = v
 
-        # Compute input current for each neuron:
-        # I(t) = w_i * x_i(t)
-        #
-        # x: (batch_size, n_in, num_time_points)
-        # transpose to: (batch_size, num_time_points, n_in)
-        #
-        # w: (n_in, n_out)
-        #
-        # result: (batch_size, num_time_points, n_out)
-        # then transpose back to:
-        # (batch_size, n_out, num_time_points)
-        input_current = torch.matmul(
-            x.transpose(1, 2),
-            self.w,
-        )
-
-        input_current = input_current.transpose(1, 2)
-
-        # Initialise membrane potential
-        voltage = torch.full(
-            (batch_size, self.n_out),
-            self.v_rest,
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        # Recorded voltage over time
-        voltage_trace = torch.zeros(
-            (batch_size, self.n_out, num_time_points),
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        # Output spikes or voltage
-        output = torch.zeros(
-            (batch_size, self.n_out, num_time_points),
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        # Reshape tau so that it broadcasts over the batch dimension
-        tau = self.tau.view(1, self.n_out)
-
-        # Keep the time constants positive and prevent division by zero
-        tau = torch.clamp(tau, min=self.dt)
-
-        # Precompute alpha = exp(-dt / tau) for leaky integration
-        alpha = torch.exp(-self.dt / tau)
-
-        # Time-stepping loop
-        for time_index in range(num_time_points):
-
-            # Update membrane potential:
-            # v(t) = alpha * v(t-1) + I(t)
-            voltage = (
-                alpha * voltage
-                + input_current[:, :, time_index]
-            )
-
-            if self.spiking:
-                # Generate spikes using the surrogate
-                # Heaviside function
-                spikes = surrogate_heaviside(
-                    voltage - self.v_th
-                )
-
-                # Record the voltage before resetting it
-                voltage_trace[:, :, time_index] = voltage
-
-                # Reset voltage after a spike
-                #
-                # Reset voltage to v_reset where spikes occur,
-                # while keeping other voltages unchanged
-                voltage = (
-                    voltage * (1.0 - spikes)
-                    + self.v_reset * spikes
-                )
-
-                output[:, :, time_index] = spikes
-
-            else:
-                # Non-spiking mode simply records voltage
-                voltage_trace[:, :, time_index] = voltage
-                output[:, :, time_index] = voltage
-
-        return output, voltage_trace
+            return y, v_trace
 
 
 class SNNNetwork(nn.Module):
-    """
-    A spiking neural network container.
-
-    The network passes its input through a sequence of SNNLayer
-    instances.
-    """
-
     def __init__(self, layers):
         """
+        A spiking neural network container.
+
         Args:
-            layers : list of nn.Module
-                List of layers, such as SNNLayer instances, that form
-                the network.
+            layers (list of nn.Module): List of layers (e.g., SNNLayer instances) that form the network.
         """
 
         super().__init__()
-
-        # Store the layers as a ModuleList so PyTorch tracks
-        # their trainable parameters
+        # Store the layers as a ModuleList so PyTorch tracks their parameters
         self.layers = nn.ModuleList(layers)
 
-        if len(self.layers) == 0:
-            raise ValueError(
-                "SNNNetwork requires at least one layer."
-            )
-
     def forward(self, x):
-        """
-        Pass the input through each layer in sequence.
-
-        Args:
-            x : torch.Tensor
-                Input tensor with shape
-                (batch_size, input_neurons, num_time_points).
-
-        Returns:
-            output : torch.Tensor
-                Output of the final layer.
-
-            layer_outputs : list of torch.Tensor
-                Output from every layer in the network.
-
-            voltage_traces : list of torch.Tensor
-                Membrane-potential trace from every layer.
-        """
-
         # Store outputs from all layers
         layer_outputs = []
-
-        # Store voltage traces from all layers
-        voltage_traces = []
-
-        # Start with the network input
-        input_signal = x
+        input_signal = x  # start with input
 
         # Pass the input through each layer in sequence
         for layer in self.layers:
-
-            # Compute the output of the current layer
-            output, voltage_trace = layer(input_signal)
-
-            # Save this layer's output
-            layer_outputs.append(output)
-
-            # Save this layer's membrane-potential trace
-            voltage_traces.append(voltage_trace)
-
+            out, _ = layer(input_signal)  # Compute the output of the current layer
+            layer_outputs.append(out)   # Save this layer's output
             # Output of this layer becomes input to the next layer
-            input_signal = output
+            input_signal = out
 
-        return output, layer_outputs, voltage_traces
+        return out, layer_outputs

@@ -1,178 +1,87 @@
-import numpy as np
 import torch
 from torch import nn
+from tqdm import tqdm
 
-from .evaluation import evaluate_network
-from .utils import clamp_time_constants, save_checkpoint
+from .evaluation import evaluate_loss
 
 
 def train_model(
-    model,
+    net,
+    optimizer,
     train_data,
     val_data,
     num_epochs=10,
-    learning_rate=1e-3,
-    weight_decay=0.0,
-    max_num_batches=None,
-    device="cpu",
-    checkpoint_path=None,
+    label="Model",
 ):
     """
-    Train the network to minimise the mean squared error between
-    the output of the network and the recorded velocities.
+    Train a model and record validation loss after each epoch.
 
     Args:
-        model : torch.nn.Module
+        net : SNNNetwork
             Network to train.
 
+        optimizer : torch.optim.Optimizer
+            Optimiser used to update the network parameters.
+
         train_data : callable
-            Function that returns a fresh generator of training batches.
-
-            Each batch should contain:
-
-                x : torch.Tensor
-                    Shape
-                    (batch_size, num_neurons, num_time_points).
-
-                y : torch.Tensor
-                    Shape
-                    (batch_size, 2, num_time_points).
+            Function returning a fresh generator of training batches.
 
         val_data : callable
-            Function that returns a fresh generator of validation batches.
+            Function returning a fresh generator of validation batches.
 
         num_epochs : int
-            Number of complete passes over the training data.
+            Number of training epochs.
 
-        learning_rate : float
-            Learning rate for the optimiser.
-
-        weight_decay : float
-            L2 regularisation used by the optimiser.
-
-        max_num_batches : int or None
-            Maximum number of training batches used per epoch.
-            If None, every available batch is used.
-
-        device : str or torch.device
-            Device on which the model should be trained.
-
-        checkpoint_path : str or None
-            Optional path used to save the best model.
+        label : str
+            Model name shown in the progress bar.
 
     Returns:
-        history : dict
-            Training and validation loss for every epoch.
+        net : SNNNetwork
+            Trained network.
+
+        hist : list
+            Validation loss history.
     """
 
-    # Move the network to the selected device
-    model = model.to(device)
+    criterion = nn.MSELoss()  # MSE loss
+    hist = []  # validation loss history
 
-    # Loss function: Mean Squared Error
-    criterion = nn.MSELoss()
+    for epoch in tqdm(
+        range(num_epochs),
+        desc=f"Training {label}",
+    ):
+        net.train()
 
-    # Optimizer: Adam
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
+        # Create a fresh training-data generator
+        gen = train_data()
 
-    # Stores training and validation loss per epoch
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-        "null_val_loss": [],
-    }
+        for x, y in gen:
+            # Move the batch to the same device as the model
+            device = next(net.parameters()).device
+            x, y = x.to(device), y.to(device)
 
-    # Store the best validation loss so the best model can be saved
-    best_val_loss = float("inf")
+            optimizer.zero_grad()  # reset gradients
 
-    # Training loop
-    for epoch in range(num_epochs):
+            out, _ = net(x)  # forward pass
 
-        # Set the model to training mode
-        model.train()
+            loss = criterion(out, y)  # compute loss
 
-        # Track loss for this epoch
-        local_loss = []
+            loss.backward()  # backprop through SNN
 
-        # A fresh generator must be created at the start of every epoch
-        for batch_index, (x, y) in enumerate(train_data()):
+            optimizer.step()  # apply Adam update
 
-            # Stop early when only a limited number of batches are required
-            if (
-                max_num_batches is not None
-                and batch_index >= max_num_batches
-            ):
-                break
+            with torch.no_grad():
+                for layer in net.layers:
+                    layer.tau.data.clamp_(
+                        min=0.001
+                    )  # stabilise tau values
 
-            # Move data to the selected device
-            x = x.to(device)
-            y = y.to(device)
-
-            # Clear previous gradients
-            optimizer.zero_grad()
-
-            # Forward pass
-            y_out, _, _ = model(x)
-
-            # Compute loss
-            loss = criterion(y_out, y)
-
-            # Backpropagation
-            loss.backward()
-
-            # Update weights and time constants
-            optimizer.step()
-
-            # Clamp tau parameters to ensure they stay positive
-            clamp_time_constants(model, minimum=0.001)
-
-            # Record batch loss
-            local_loss.append(loss.item())
-
-        if not local_loss:
-            raise RuntimeError(
-                "The training data generator produced no batches. "
-                "Check the batch size and number of available segments."
-            )
-
-        # Compute average training loss for the epoch
-        train_loss = float(np.mean(local_loss))
-
-        # Validation
-        validation_results = evaluate_network(
-            model=model,
-            data_generator=val_data,
-            device=device,
+        # Validation per epoch
+        val_loss, _ = evaluate_loss(
+            net,
+            val_data,
         )
 
-        val_loss = validation_results["loss"]
-        null_val_loss = validation_results["null_loss"]
+        hist.append(val_loss)
 
-        # Record losses
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["null_val_loss"].append(null_val_loss)
-
-        print(
-            f"Epoch {epoch + 1:02d}/{num_epochs} | "
-            f"train loss: {train_loss:.6f} | "
-            f"validation loss: {val_loss:.6f} | "
-            f"null loss: {null_val_loss:.6f}"
-        )
-
-        # Save the model when validation performance improves
-        if checkpoint_path is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
-
-            save_checkpoint(
-                path=checkpoint_path,
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                history=history,
-            )
-
-    return history
+    return net, hist

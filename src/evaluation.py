@@ -1,216 +1,94 @@
-import numpy as np
 import torch
 from torch import nn
 
 
-def compute_loss(
-    model,
-    data_generator,
-    device="cpu",
-    null_model=False,
-):
+def compute_loss(net, data_generator, null_model=False):
     """
-    Compute mean squared error over all batches from a data generator.
+    Compute the mean squared error (MSE) over a dataset.
 
     Args:
-        model : torch.nn.Module
-            Trained neural network.
-
-        data_generator : callable
-            Function that returns a fresh batch generator.
-
-        device : str or torch.device
-            Device on which evaluation should run.
-
-        null_model : bool
-            If True, use a prediction of zero instead of the model
-            output. Since the velocity data have been centred, zero
-            represents the mean-velocity baseline.
+        net (nn.Module): The spiking neural network to evaluate.
+        data_generator (iterable): Generator that yields batches of (x, y) data.
+        null_model (bool, optional): If True, computes loss assuming
+            the network predicts all zeros.
 
     Returns:
-        mean_loss : float
-            Mean loss across all evaluated batches.
+        float: Mean MSE over all batches.
     """
 
-    criterion = nn.MSELoss()
+    # Define the loss function (mean squared error)
+    loss_fn = nn.MSELoss()
 
-    # Store loss for each batch
-    losses = []
+    # Initialize counts for total loss and number of batches
+    total_loss = 0.0
+    count = 0
 
-    # Set model to evaluation mode
-    model.eval()
+    # Set network to evaluation mode
+    net.eval()
 
-    # Disable gradients for efficiency
-    with torch.no_grad():
+    # Find which device the model is stored on
+    device = next(net.parameters()).device
 
-        for x, y in data_generator():
+    with torch.no_grad():  # Disable gradients for speed/memory
+        for x, y in data_generator:  # Iterate over batches from generator
 
-            # Move data to the selected device
-            x = x.to(device)
-            y = y.to(device)
+            # Move data to the same device as the model
+            x, y = x.to(device), y.to(device)
 
             if null_model:
-                # The null model always predicts zero velocity
-                prediction = torch.zeros_like(y)
-
+                # Null model: predict zeros for all outputs
+                pred = torch.zeros_like(y)
             else:
-                # Forward pass through the trained network
-                prediction, _, _ = model(x)
+                # SNN Model: Get prediction from network
+                pred, _ = net(x)
 
-            # Compute loss
-            loss = criterion(prediction, y)
+            # Compute MSE for this batch
+            loss = loss_fn(pred, y)
 
-            losses.append(loss.item())
+            # Accumulate total loss
+            total_loss += loss.item()
 
-    if not losses:
-        raise RuntimeError(
-            "The evaluation data generator produced no batches. "
-            "Check the batch size and number of available segments."
-        )
+            # Count this batch
+            count += 1
 
-    return float(np.mean(losses))
+    if count == 0:
+        raise ValueError("The data generator produced no batches.")
+    
+    # Return average loss over all batches
+    return total_loss / count
 
 
-def evaluate_network(
-    model,
-    data_generator,
-    device="cpu",
-):
+
+def evaluate_loss(net, data_generator):
     """
-    Evaluate the model against a null baseline.
+    Evaluates the model against a null baseline.
+
+    Args:
+        net : nn.Module
+            Network to evaluate.
+
+        data_generator : callable
+            Function that returns a fresh generator of batches.
 
     Returns:
-        results : dict
-            Contains the model loss, null-model loss and improvement
-            over the null model.
+        model_loss : float
+            Mean squared error of the network.
+
+        null_model_loss : float
+            Mean squared error of the null model.
     """
 
-    # Compute network loss
-    model_loss = compute_loss(
-        model=model,
-        data_generator=data_generator,
-        device=device,
-        null_model=False,
-    )
+    # Batch generator for validation or test data
+    gen = data_generator()
+    model_loss = compute_loss(net, gen)  # Compute loss
 
-    # Compute null-model loss
-    null_loss = compute_loss(
-        model=model,
-        data_generator=data_generator,
-        device=device,
+    # A new generator is needed because the first generator
+    # has already been consumed
+    gen_null = data_generator()
+    null_model_loss = compute_loss(
+        net,
+        gen_null,
         null_model=True,
-    )
+    )  # Compute null loss
 
-    # Positive values indicate that the trained network performs
-    # better than the null model
-    improvement = null_loss - model_loss
-
-    return {
-        "loss": model_loss,
-        "null_loss": null_loss,
-        "improvement": improvement,
-    }
-
-
-def predict_batches(
-    model,
-    data_generator,
-    device="cpu",
-):
-    """
-    Generate predictions for all batches returned by a data generator.
-
-    Returns:
-        predictions : np.ndarray
-            Predicted velocity sequences.
-
-        targets : np.ndarray
-            Recorded velocity sequences.
-    """
-
-    predictions = []
-    targets = []
-
-    # Set model to evaluation mode
-    model.eval()
-
-    # Disable gradients during inference
-    with torch.no_grad():
-
-        for x, y in data_generator():
-
-            # Move input data to the selected device
-            x = x.to(device)
-
-            # Forward pass
-            y_out, _, _ = model(x)
-
-            # Store predictions and targets on the CPU
-            predictions.append(y_out.cpu())
-            targets.append(y.cpu())
-
-    if not predictions:
-        raise RuntimeError(
-            "The data generator produced no batches."
-        )
-
-    # Join all batches together
-    predictions = torch.cat(predictions, dim=0).numpy()
-    targets = torch.cat(targets, dim=0).numpy()
-
-    return predictions, targets
-
-
-def calculate_mse(predictions, targets):
-    """
-    Compute mean squared error between predictions and targets.
-    """
-
-    predictions = np.asarray(predictions)
-    targets = np.asarray(targets)
-
-    if predictions.shape != targets.shape:
-        raise ValueError(
-            "Predictions and targets must have the same shape. "
-            f"Received {predictions.shape} and {targets.shape}."
-        )
-
-    return float(np.mean((predictions - targets) ** 2))
-
-
-def calculate_component_mse(predictions, targets):
-    """
-    Compute separate mean squared errors for x and y velocity.
-
-    The expected array shape is:
-
-        (num_samples, 2, num_time_points)
-    """
-
-    predictions = np.asarray(predictions)
-    targets = np.asarray(targets)
-
-    if predictions.shape != targets.shape:
-        raise ValueError(
-            "Predictions and targets must have the same shape."
-        )
-
-    if predictions.ndim != 3 or predictions.shape[1] != 2:
-        raise ValueError(
-            "Expected arrays with shape "
-            "(num_samples, 2, num_time_points)."
-        )
-
-    # Compute loss for each velocity component
-    x_mse = np.mean(
-        (predictions[:, 0, :] - targets[:, 0, :]) ** 2
-    )
-
-    y_mse = np.mean(
-        (predictions[:, 1, :] - targets[:, 1, :]) ** 2
-    )
-
-    return {
-        "x_mse": float(x_mse),
-        "y_mse": float(y_mse),
-    }
+    return model_loss, null_model_loss
